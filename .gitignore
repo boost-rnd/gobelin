@@ -1,0 +1,9 @@
+# Binaries
+/gobelin
+/scan
+
+# Test coverage
+coverage.out
+
+# macOS
+.DS_Store
