@@ -25,65 +25,90 @@ import (
 	"time"
 )
 
-func TestParseGitHubPath(t *testing.T) {
+func TestParsePath(t *testing.T) {
 	tests := []struct {
-		name      string
-		path      string
-		wantOwner string
-		wantRepo  string
+		name         string
+		path         string
+		wantOwner    string
+		wantRepo     string
+		wantRegistry string
 	}{
 		{
-			name:      "full package path",
-			path:      "github.com/spf13/cobra",
-			wantOwner: "spf13",
-			wantRepo:  "cobra",
+			name:         "full package path",
+			path:         "github.com/spf13/cobra",
+			wantOwner:    "spf13",
+			wantRepo:     "cobra",
+			wantRegistry: "github.com",
 		},
 		{
-			name:      "package with subpath",
-			path:      "github.com/spf13/cobra/doc",
-			wantOwner: "spf13",
-			wantRepo:  "cobra",
+			name:         "package with subpath",
+			path:         "github.com/spf13/cobra/doc",
+			wantOwner:    "spf13",
+			wantRepo:     "cobra",
+			wantRegistry: "github.com",
 		},
 		{
-			name:      "owner only",
-			path:      "github.com/spf13",
-			wantOwner: "spf13",
-			wantRepo:  "",
+			name:         "owner only",
+			path:         "github.com/spf13",
+			wantOwner:    "spf13",
+			wantRepo:     "",
+			wantRegistry: "github.com",
 		},
 		{
-			name:      "non-github path",
-			path:      "golang.org/x/tools",
-			wantOwner: "",
-			wantRepo:  "",
+			name:         "non-github path",
+			path:         "golang.org/x/tools",
+			wantOwner:    "",
+			wantRepo:     "",
+			wantRegistry: "",
 		},
 		{
-			name:      "empty path",
-			path:      "",
-			wantOwner: "",
-			wantRepo:  "",
+			name:         "empty path",
+			path:         "",
+			wantOwner:    "",
+			wantRepo:     "",
+			wantRegistry: "",
 		},
 		{
-			name:      "github.com only",
-			path:      "github.com",
-			wantOwner: "",
-			wantRepo:  "",
+			name:         "github.com only",
+			path:         "github.com",
+			wantOwner:    "",
+			wantRepo:     "",
+			wantRegistry: "",
 		},
 		{
-			name:      "github.com with trailing slash",
-			path:      "github.com/",
-			wantOwner: "",
-			wantRepo:  "",
+			name:         "github.com with trailing slash",
+			path:         "github.com/",
+			wantOwner:    "",
+			wantRepo:     "",
+			wantRegistry: "github.com",
+		},
+		{
+			name:         "full gitlab path",
+			path:         "gitlab.com/bosi/decorder",
+			wantOwner:    "bosi",
+			wantRepo:     "decorder",
+			wantRegistry: "gitlab.com",
+		},
+		{
+			name:         "gitlab owner",
+			path:         "gitlab.com/bosi",
+			wantOwner:    "bosi",
+			wantRepo:     "",
+			wantRegistry: "gitlab.com",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotOwner, gotRepo := parseGitHubPath(tt.path)
+			gotOwner, gotRepo, gotRegistry := parsePath(tt.path)
 			if gotOwner != tt.wantOwner {
-				t.Errorf("parseGitHubPath() gotOwner = %v, want %v", gotOwner, tt.wantOwner)
+				t.Errorf("parsePath() gotOwner = %v, want %v", gotOwner, tt.wantOwner)
 			}
 			if gotRepo != tt.wantRepo {
-				t.Errorf("parseGitHubPath() gotRepo = %v, want %v", gotRepo, tt.wantRepo)
+				t.Errorf("parsePath() gotRepo = %v, want %v", gotRepo, tt.wantRepo)
+			}
+			if gotRegistry != tt.wantRegistry {
+				t.Errorf("parsePath() gotRegistry = %v, want %v", gotRegistry, tt.wantRegistry)
 			}
 		})
 	}
@@ -103,10 +128,25 @@ func TestExtractPackages(t *testing.T) {
 			},
 			wantLen: 1,
 			wantPkg: &Package{
-				Path:    "github.com/spf13/cobra",
-				Version: "v1.0.0",
-				Owner:   "spf13",
-				Repo:    "cobra",
+				Path:     "github.com/spf13/cobra",
+				Version:  "v1.0.0",
+				Owner:    "spf13",
+				Repo:     "cobra",
+				Registry: "github.com",
+			},
+		},
+		{
+			name: "single gitlab package",
+			sbom: []SBOMModule{
+				{Path: "gitlab.com/bosi/decorder", Version: "v0.4.0"},
+			},
+			wantLen: 1,
+			wantPkg: &Package{
+				Path:     "gitlab.com/bosi/decorder",
+				Version:  "v0.4.0",
+				Owner:    "bosi",
+				Repo:     "decorder",
+				Registry: "gitlab.com",
 			},
 		},
 		{
@@ -123,10 +163,11 @@ func TestExtractPackages(t *testing.T) {
 			},
 			wantLen: 1,
 			wantPkg: &Package{
-				Path:    "github.com/new/package",
-				Version: "v2.0.0",
-				Owner:   "new",
-				Repo:    "package",
+				Path:     "github.com/new/package",
+				Version:  "v2.0.0",
+				Owner:    "new",
+				Repo:     "package",
+				Registry: "github.com",
 			},
 		},
 		{
@@ -135,8 +176,9 @@ func TestExtractPackages(t *testing.T) {
 				{Path: "github.com/spf13/cobra", Version: "v1.0.0"},
 				{Path: "golang.org/x/tools", Version: "v0.1.0"},
 				{Path: "github.com/fatih/color", Version: "v1.13.0"},
+				{Path: "gitlab.com/bosi/decorder", Version: "v0.4.0"},
 			},
-			wantLen: 2,
+			wantLen: 3,
 		},
 		{
 			name:    "empty sbom",
@@ -366,29 +408,162 @@ github.com/spf13/cobra
 	})
 }
 
-func TestCheckGitHubUser(t *testing.T) {
-	// Note: This makes real API calls, so it's a light integration test
-	// In production, we'd use dependency injection for better testability
-	t.Run("basic functionality", func(t *testing.T) {
-		client := &http.Client{Timeout: 5 * time.Second}
+func TestCheckUser(t *testing.T) {
 
-		// Test with a known GitHub user (golang org should always exist)
-		exists, statusCode, resetTime := checkGitHubUser(client, "golang")
-		_ = resetTime // resetTime is used for rate limiting
+	client := &http.Client{Timeout: 5 * time.Second}
 
-		// We expect golang to exist, but won't fail if API is down
-		if statusCode != 200 && statusCode != 404 && statusCode != 403 && statusCode != 429 {
-			t.Logf("Unexpected status code: %d (possibly API issue)", statusCode)
-		}
+	tests := []struct {
+		name              string
+		pkg               Package
+		wantExists        bool
+		wantStatusCode    int
+		skipIfRateLimited bool
+	}{
+		{
+			name: "GitHub - known user exists (golang)",
+			pkg: Package{
+				Registry: "github.com",
+				Path:     "github.com/golang/go",
+				Version:  "",
+				Owner:    "golang",
+				Repo:     "go",
+			},
+			wantExists:        true,
+			wantStatusCode:    200,
+			skipIfRateLimited: true,
+		},
+		{
+			name: "GitHub - known user exists (torvalds)",
+			pkg: Package{
+				Registry: "github.com",
+				Path:     "github.com/torvalds/linux",
+				Version:  "",
+				Owner:    "torvalds",
+				Repo:     "linux",
+			},
+			wantExists:        true,
+			wantStatusCode:    200,
+			skipIfRateLimited: true,
+		},
+		{
+			name: "GitHub - non-existent user",
+			pkg: Package{
+				Registry: "github.com",
+				Path:     "github.com/this-user-definitely-does-not-exist-12345/repo",
+				Version:  "",
+				Owner:    "this-user-definitely-does-not-exist-12345",
+				Repo:     "repo",
+			},
+			wantExists:        false,
+			wantStatusCode:    404,
+			skipIfRateLimited: true,
+		},
+		{
+			name: "GitLab - known user exists (gitlab-org)",
+			pkg: Package{
+				Registry: "gitlab.com",
+				Path:     "gitlab.com/gitlab-org/gitlab",
+				Version:  "",
+				Owner:    "gitlab",
+				Repo:     "gitlab",
+			},
+			wantExists:        true,
+			wantStatusCode:    200,
+			skipIfRateLimited: true,
+		},
+		{
+			name: "GitLab - non-existent user",
+			pkg: Package{
+				Registry: "gitlab.com",
+				Path:     "gitlab.com/this-user-definitely-does-not-exist-99999/repo",
+				Version:  "",
+				Owner:    "this-user-definitely-does-not-exist-99999",
+				Repo:     "repo",
+			},
+			wantExists:        false,
+			wantStatusCode:    200, // GitLab returns 200 even for non-existent users
+			skipIfRateLimited: true,
+		},
+		{
+			name: "Unsupported registry (bitbucket)",
+			pkg: Package{
+				Registry: "bitbucket.org",
+				Path:     "bitbucket.org/someuser/repo",
+				Version:  "",
+				Owner:    "someuser",
+				Repo:     "repo",
+			},
+			wantExists:        false,
+			wantStatusCode:    0,
+			skipIfRateLimited: false,
+		},
+		{
+			name: "Unsupported registry (custom domain)",
+			pkg: Package{
+				Registry: "git.company.com",
+				Path:     "git.company.com/team/project",
+				Version:  "",
+				Owner:    "team",
+				Repo:     "project",
+			},
+			wantExists:        false,
+			wantStatusCode:    0,
+			skipIfRateLimited: false,
+		},
+	}
 
-		// Just verify the function returns reasonable values
-		if statusCode == 200 && !exists {
-			t.Error("checkGitHubUser() exists should be true when status is 200")
-		}
-		if statusCode == 404 && exists {
-			t.Error("checkGitHubUser() exists should be false when status is 404")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exists, statusCode, resetTime := checkUser(client, tt.pkg)
+
+			// Handle rate limiting gracefully
+			if (statusCode == 403 || statusCode == 429) && tt.skipIfRateLimited {
+				t.Logf("Skipping test due to rate limiting (status: %d, reset: %v)",
+					statusCode, resetTime)
+				t.Skip("Rate limited by API")
+				return
+			}
+
+			// Check status code
+			if statusCode != tt.wantStatusCode {
+				// Allow some flexibility for API issues
+				if statusCode != 403 && statusCode != 429 {
+					t.Errorf("checkUser() statusCode = %v, want %v",
+						statusCode, tt.wantStatusCode)
+				} else {
+					t.Logf("Unexpected status code: %d (rate limited or API issue)", statusCode)
+				}
+			}
+
+			// Check exists flag
+			if exists != tt.wantExists {
+				t.Errorf("checkUser() exists = %v, want %v", exists, tt.wantExists)
+			}
+
+			// Verify consistency between status and exists flag
+			if tt.pkg.Registry == "github.com" {
+				if statusCode == 200 && !exists {
+					t.Error("Inconsistent result: status 200 but exists=false")
+				}
+				if statusCode == 404 && exists {
+					t.Error("Inconsistent result: status 404 but exists=true")
+				}
+			} else if tt.pkg.Registry == "gitlab.com" {
+				// GitLab always returns 200, so we only check the exists flag
+				if statusCode == 200 && exists != tt.wantExists {
+					t.Errorf("GitLab exists flag mismatch: got %v, want %v",
+						exists, tt.wantExists)
+				}
+			}
+
+			// For unsupported registries, resetTime should be zero
+			if tt.pkg.Registry != "github.com" && tt.pkg.Registry != "gitlab.com" {
+				if !resetTime.IsZero() {
+					t.Error("Expected zero resetTime for unsupported registry")
+				}
+			}
+		})
+	}
 }
 
 func TestCheckGitHubAccounts(t *testing.T) {
@@ -406,10 +581,11 @@ func TestCheckGitHubAccounts(t *testing.T) {
 			name: "single package",
 			packages: []Package{
 				{
-					Path:    "github.com/golang/go",
-					Version: "v1.20.0",
-					Owner:   "golang",
-					Repo:    "go",
+					Path:     "github.com/golang/go",
+					Version:  "v1.20.0",
+					Owner:    "golang",
+					Repo:     "go",
+					Registry: "github.com",
 				},
 			},
 			wantLen: 1,
@@ -418,16 +594,18 @@ func TestCheckGitHubAccounts(t *testing.T) {
 			name: "duplicate owners",
 			packages: []Package{
 				{
-					Path:    "github.com/golang/go",
-					Version: "v1.20.0",
-					Owner:   "golang",
-					Repo:    "go",
+					Path:     "github.com/golang/go",
+					Version:  "v1.20.0",
+					Owner:    "golang",
+					Repo:     "go",
+					Registry: "github.com",
 				},
 				{
-					Path:    "github.com/golang/tools",
-					Version: "v0.1.0",
-					Owner:   "golang",
-					Repo:    "tools",
+					Path:     "github.com/golang/tools",
+					Version:  "v0.1.0",
+					Owner:    "golang",
+					Repo:     "tools",
+					Registry: "github.com",
 				},
 			},
 			wantLen: 1, // Should deduplicate by owner
@@ -441,24 +619,24 @@ func TestCheckGitHubAccounts(t *testing.T) {
 			defer func() { githubToken = originalToken }()
 			githubToken = "" // Test without token
 
-			results := checkGitHubAccounts(tt.packages)
+			results := checkAccounts(tt.packages)
 			if len(results) != tt.wantLen {
-				t.Errorf("checkGitHubAccounts() returned %d results, want %d", len(results), tt.wantLen)
+				t.Errorf("checkAccounts() returned %d results, want %d", len(results), tt.wantLen)
 			}
 
 			// Verify result structure
 			for _, result := range results {
 				if _, ok := result["owner"]; !ok {
-					t.Error("checkGitHubAccounts() result missing 'owner' field")
+					t.Error("checkAccounts() result missing 'owner' field")
 				}
 				if _, ok := result["exists"]; !ok {
-					t.Error("checkGitHubAccounts() result missing 'exists' field")
+					t.Error("checkAccounts() result missing 'exists' field")
 				}
 				if _, ok := result["status_code"]; !ok {
-					t.Error("checkGitHubAccounts() result missing 'status_code' field")
+					t.Error("checkAccounts() result missing 'status_code' field")
 				}
 				if _, ok := result["package"]; !ok {
-					t.Error("checkGitHubAccounts() result missing 'package' field")
+					t.Error("checkAccounts() result missing 'package' field")
 				}
 			}
 		})
@@ -558,6 +736,67 @@ func TestDetectGitHubToken(t *testing.T) {
 		os.Unsetenv("GITHUB_TOKEN")
 		// gh auth token will also fail in test environment
 		token := detectGitHubToken()
+		// Token could be empty or from gh CLI if available
+		_ = token // Just verify function doesn't crash
+	})
+}
+
+func TestDetectGitLabToken(t *testing.T) {
+	t.Run("detects token from GL_TOKEN", func(t *testing.T) {
+		oldToken := os.Getenv("GL_TOKEN")
+		defer os.Setenv("GL_TOKEN", oldToken)
+
+		os.Setenv("GL_TOKEN", "test-token-123")
+		token := detectGitLabToken()
+		if token != "test-token-123" {
+			t.Errorf("detectGitLabToken() = %v, want 'test-token-123'", token)
+		}
+	})
+
+	t.Run("detects token from GITLAB_TOKEN", func(t *testing.T) {
+		oldGHToken := os.Getenv("GL_TOKEN")
+		oldGitHubToken := os.Getenv("GITLAB_TOKEN")
+		defer func() {
+			os.Setenv("GL_TOKEN", oldGHToken)
+			os.Setenv("GITLAB_TOKEN", oldGitHubToken)
+		}()
+
+		os.Unsetenv("GL_TOKEN")
+		os.Setenv("GITLAB_TOKEN", "gitlab-token-456")
+		token := detectGitLabToken()
+		if token != "gitlab-token-456" {
+			t.Errorf("detectGitLabToken() = %v, want 'gitlab-token-456'", token)
+		}
+	})
+
+	t.Run("GL_TOKEN takes precedence over GITLAB_TOKEN", func(t *testing.T) {
+		oldGHToken := os.Getenv("GL_TOKEN")
+		oldGitHubToken := os.Getenv("GITLAB_TOKEN")
+		defer func() {
+			os.Setenv("GL_TOKEN", oldGHToken)
+			os.Setenv("GITLAB_TOKEN", oldGitHubToken)
+		}()
+
+		os.Setenv("GL_TOKEN", "priority-token")
+		os.Setenv("GITLAB_TOKEN", "backup-token")
+		token := detectGitLabToken()
+		if token != "priority-token" {
+			t.Errorf("detectGitLabToken() = %v, want 'priority-token'", token)
+		}
+	})
+
+	t.Run("returns empty when no token available", func(t *testing.T) {
+		oldGHToken := os.Getenv("GL_TOKEN")
+		oldGitHubToken := os.Getenv("GITHUB_TOKEN")
+		defer func() {
+			os.Setenv("GL_TOKEN", oldGHToken)
+			os.Setenv("GITHUB_TOKEN", oldGitHubToken)
+		}()
+
+		os.Unsetenv("GL_TOKEN")
+		os.Unsetenv("GITHUB_TOKEN")
+		// gh auth token will also fail in test environment
+		token := detectGitLabToken()
 		// Token could be empty or from gh CLI if available
 		_ = token // Just verify function doesn't crash
 	})

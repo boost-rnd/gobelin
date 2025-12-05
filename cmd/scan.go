@@ -33,10 +33,11 @@ import (
 )
 
 type Package struct {
-	Path    string
-	Version string
-	Owner   string
-	Repo    string
+	Path     string
+	Version  string
+	Owner    string
+	Repo     string
+	Registry string
 }
 
 type SBOMModule struct {
@@ -45,9 +46,16 @@ type SBOMModule struct {
 	Replace *SBOMModule `json:"Replace,omitempty"` // Handles replace directives
 }
 
+type registryAccount struct {
+	Registry string
+	Owner    string
+}
+
 var (
-	githubToken string
-	outputFile  string
+	githubToken   string
+	gitlabToken   string
+	outputFile    string
+	goListTimeout time.Duration = 30 * time.Second
 )
 
 // scanCmd represents the scan command
@@ -109,10 +117,50 @@ func detectGitHubToken() string {
 	return ""
 }
 
+// detectGitLabToken attempts to auto-detect a GitLab token from environment or gh CLI
+func detectGitLabToken() string {
+	// Try GL_TOKEN environment variable first
+	if token := os.Getenv("GL_TOKEN"); token != "" {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "→ Using GitLab token from GL_TOKEN\n")
+		}
+		return token
+	}
+
+	// Try GITLAB_TOKEN environment variable (common in CI)
+	if token := os.Getenv("GITLAB_TOKEN"); token != "" {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "→ Using GitLab token from GITLAB_TOKEN\n")
+		}
+		return token
+	}
+
+	// Try glab CLI auth token
+	cmd := exec.Command("glab", "auth", "status", "--show-token")
+	output, err := cmd.Output()
+	if err == nil && len(output) > 0 {
+		token := strings.TrimSpace(string(output))
+		if token != "" {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "→ Using GitLab token from 'glab auth status --show-token'\n")
+			}
+			return token
+		}
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "→ No GitLab token found, proceeding without authentication\n")
+	}
+	return ""
+}
+
 func ScanProject(cmd *cobra.Command, args []string) error {
-	// Auto-detect GitHub token if not provided
+	// Auto-detect tokens if not provided
 	if githubToken == "" {
 		githubToken = detectGitHubToken()
+	}
+	if gitlabToken == "" {
+		gitlabToken = detectGitLabToken()
 	}
 
 	projectPath := "."
@@ -172,13 +220,13 @@ func ScanProject(cmd *cobra.Command, args []string) error {
 
 	uniqueAccounts := countUniqueOwners(packages)
 	if verbose {
-		fmt.Fprintf(os.Stderr, "→ Checking %d unique GitHub accounts...\n", uniqueAccounts)
+		fmt.Fprintf(os.Stderr, "→ Checking %d unique accounts...\n", uniqueAccounts)
 	} else if outputFormat == "text" {
-		fmt.Printf("Checking %d unique GitHub accounts...\n", uniqueAccounts)
+		fmt.Printf("Checking %d unique accounts...\n", uniqueAccounts)
 	}
 
-	// Check GitHub accounts
-	results := checkGitHubAccounts(packages)
+	// Check GitHub and GitLab accounts
+	results := checkAccounts(packages)
 
 	// Output results
 	return outputResults(results)
@@ -265,16 +313,17 @@ func extractPackages(sbom []SBOMModule) []Package {
 		}
 
 		// Extract GitHub owner and repo
-		owner, repo := parseGitHubPath(actualModule.Path)
+		owner, repo, registry := parsePath(actualModule.Path)
 		if owner == "" {
 			continue
 		}
 
 		packages = append(packages, Package{
-			Path:    actualModule.Path,
-			Version: actualModule.Version,
-			Owner:   owner,
-			Repo:    repo,
+			Registry: registry,
+			Path:     actualModule.Path,
+			Version:  actualModule.Version,
+			Owner:    owner,
+			Repo:     repo,
 		})
 	}
 
@@ -300,19 +349,17 @@ func readPackagesFromFile(filePath string) ([]Package, error) {
 		packagePath := line
 
 		// Extract owner and repo
-		owner, repo := parseGitHubPath(packagePath)
+		owner, repo, registry := parsePath(packagePath)
 		if owner == "" {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "⚠ Could not parse GitHub path (line %d: %s)\n", lineNumber, line)
-			}
 			continue
 		}
 
 		packages = append(packages, Package{
-			Path:    packagePath,
-			Version: "", // Version unknown for file-based packages
-			Owner:   owner,
-			Repo:    repo,
+			Registry: registry,
+			Path:     packagePath,
+			Version:  "", // Version unknown for file-based packages
+			Owner:    owner,
+			Repo:     repo,
 		})
 	}
 
@@ -327,43 +374,69 @@ func readPackagesFromFile(filePath string) ([]Package, error) {
 	return packages, nil
 }
 
-func parseGitHubPath(path string) (owner, repo string) {
-	// Handle github.com paths
-	if strings.HasPrefix(path, "github.com/") {
+func parsePath(path string) (owner, repo, registry string) {
+	// Handle github.com and gitlab.com paths
+	if strings.HasPrefix(path, "github.com/") || strings.HasPrefix(path, "gitlab.com/") {
 		parts := strings.Split(path, "/")
 		if len(parts) >= 3 {
+			registry = parts[0]
 			owner = parts[1]
 			repo = parts[2]
 			return
 			// Ok if just the owner
 		} else if len(parts) >= 2 {
+			registry = parts[0]
 			owner = parts[1]
 			repo = ""
 			return
+		} else {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "⚠ Skipping check of package at path %s. Missing information.\n", path)
+			}
 		}
+	} else if strings.HasPrefix(path, "golang.org/") {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "(Skipping check of go built in module %s.)\n", path)
+		}
+	} else {
+		registry = strings.Split(path, "/")[0]
+		fmt.Fprintf(os.Stderr, "⚠ Unsupported registry %s. Could not verify package path %s.\n", registry, path)
 	}
-
-	return "", ""
+	return "", "", ""
 }
 
-func checkGitHubAccounts(packages []Package) []map[string]interface{} {
+func checkAccounts(packages []Package) []map[string]interface{} {
 	client := &http.Client{Timeout: 10 * time.Second}
 	results := make([]map[string]interface{}, 0, len(packages))
-	checkedOwners := make(map[string]bool)
+	checkedOwners := make(map[registryAccount]bool)
 
 	if githubToken != "" && verbose {
 		fmt.Fprintf(os.Stderr, "→ Using provided GitHub token\n")
 	}
 
+	if gitlabToken != "" && verbose {
+		fmt.Fprintf(os.Stderr, "→ Using provided GitLab token\n")
+	}
+
 	for _, pkg := range packages {
+
+		accountKey := registryAccount{
+			Registry: pkg.Registry,
+			Owner:    pkg.Owner,
+		}
+
 		// Skip if we already checked this owner
-		if checkedOwners[pkg.Owner] {
+		if checkedOwners[accountKey] {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "→ Skipping already checked %s account %s\n", accountKey.Registry, accountKey.Owner)
+			}
 			continue
 		}
 
-		exists, statusCode, resetTime := checkGitHubUser(client, pkg.Owner)
+		exists, statusCode, resetTime := checkUser(client, pkg)
 
 		result := map[string]interface{}{
+			"registry":    pkg.Registry,
 			"owner":       pkg.Owner,
 			"exists":      exists,
 			"status_code": statusCode,
@@ -372,7 +445,7 @@ func checkGitHubAccounts(packages []Package) []map[string]interface{} {
 
 		if exists {
 			if verbose {
-				fmt.Fprintf(os.Stderr, "  ✓ %s\n", pkg.Owner)
+				fmt.Fprintf(os.Stderr, "  ✓ %s/%s exists\n", pkg.Registry, pkg.Owner)
 			}
 		} else if statusCode == 403 || statusCode == 429 {
 			if verbose {
@@ -399,30 +472,45 @@ func checkGitHubAccounts(packages []Package) []map[string]interface{} {
 			if verbose {
 				fmt.Fprintf(os.Stderr, "  ↻ Retrying %s...\n", pkg.Owner)
 			}
-			exists, statusCode, _ = checkGitHubUser(client, pkg.Owner)
+			exists, statusCode, _ = checkUser(client, pkg)
 			result["exists"] = exists
 			result["status_code"] = statusCode
 
 			if exists {
 				if verbose {
-					fmt.Fprintf(os.Stderr, "  ✓ %s (after retry)\n", pkg.Owner)
+					fmt.Fprintf(os.Stderr, "  ✓ %s/%s exists (after retry)\n", pkg.Registry, pkg.Owner)
 				}
 			} else {
 				if verbose {
-					fmt.Fprintf(os.Stderr, "  ✗ %s NOT FOUND (status: %d)\n", pkg.Owner, statusCode)
+					fmt.Fprintf(os.Stderr, "  ✗ %s/%s NOT FOUND (status: %d)\n", pkg.Registry, pkg.Owner, statusCode)
 				}
 			}
 		} else {
 			if verbose {
-				fmt.Fprintf(os.Stderr, "  ✗ %s NOT FOUND (status: %d)\n", pkg.Owner, statusCode)
+				fmt.Fprintf(os.Stderr, "  ✗ %s/%s NOT FOUND (status: %d)\n", pkg.Registry, pkg.Owner, statusCode)
 			}
 		}
 
 		results = append(results, result)
-		checkedOwners[pkg.Owner] = true
+		checkedOwners[accountKey] = true
 	}
 
 	return results
+}
+
+func checkUser(client *http.Client, pkg Package) (exists bool, status int, resetTime time.Time) {
+	switch pkg.Registry {
+	case "github.com":
+		return checkGitHubUser(client, pkg.Owner)
+
+	case "gitlab.com":
+		return checkGitLabUser(client, pkg.Owner)
+
+	default:
+		// Registry not supported
+		fmt.Fprintf(os.Stderr, "✗ Unsupported registry %s. Impossible to check account %s/%s", pkg.Registry, pkg.Registry, pkg.Owner)
+		return false, 0, time.Time{}
+	}
 }
 
 func checkGitHubUser(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
@@ -455,7 +543,48 @@ func checkGitHubUser(client *http.Client, owner string) (exists bool, statusCode
 	}
 
 	return resp.StatusCode == 200, resp.StatusCode, resetTime
+}
 
+func checkGitLabUser(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	// GitLab API doc: https://docs.gitlab.com/ee/api/users.html#for-user
+	url := fmt.Sprintf("https://gitlab.com/api/v4/users?username=%s", owner)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, 0, time.Time{}
+	}
+
+	// Add token if provided (GitLab uses PRIVATE-TOKEN header)
+	if gitlabToken != "" {
+		req.Header.Set("PRIVATE-TOKEN", gitlabToken)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, 0, time.Time{}
+	}
+	defer resp.Body.Close()
+
+	// Parse rate limit reset time if we hit the limit
+	if resp.StatusCode == 429 {
+		if resetHeader := resp.Header.Get("RateLimit-Reset"); resetHeader != "" {
+			if resetUnix, err := strconv.ParseInt(resetHeader, 10, 64); err == nil {
+				resetTime = time.Unix(resetUnix, 0)
+			}
+		}
+	}
+
+	// GitLab returns 200 with an empty array [] if user doesn't exist
+	if resp.StatusCode == 200 {
+		var users []map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&users); err != nil {
+			return false, resp.StatusCode, resetTime
+		}
+		// User exists if array is not empty
+		exists = len(users) > 0
+		return exists, resp.StatusCode, resetTime
+	}
+
+	return false, resp.StatusCode, resetTime
 }
 
 func outputResults(results []map[string]interface{}) error {

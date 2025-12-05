@@ -45,6 +45,7 @@ var (
 
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&githubToken, "token", "t", "", "GitHub API token (auto-detected from GH_TOKEN, GITHUB_TOKEN, or 'gh auth token')")
+	rootCmd.PersistentFlags().StringVarP(&gitlabToken, "gitlab-token", "", "", "Gitlab API token (optional, increases rate limit)")
 	rootCmd.PersistentFlags().StringVarP(&outputFile, "output", "o", "", "Output file for results (default: stdout)")
 	rootCmd.PersistentFlags().StringVarP(&outputFormat, "format", "f", "text", "Output format: text or json")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose/debug output")
