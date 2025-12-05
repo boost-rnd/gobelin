@@ -541,23 +541,23 @@ func TestCheckUser(t *testing.T) {
 			}
 
 			// Verify consistency between status and exists flag
-			if tt.pkg.Registry == "github.com" {
+			switch tt.pkg.Registry {
+			case "github.com":
 				if statusCode == 200 && !exists {
 					t.Error("Inconsistent result: status 200 but exists=false")
 				}
 				if statusCode == 404 && exists {
 					t.Error("Inconsistent result: status 404 but exists=true")
 				}
-			} else if tt.pkg.Registry == "gitlab.com" {
+			case "gitlab.com":
 				// GitLab always returns 200, so we only check the exists flag
 				if statusCode == 200 && exists != tt.wantExists {
 					t.Errorf("GitLab exists flag mismatch: got %v, want %v",
 						exists, tt.wantExists)
 				}
-			}
 
 			// For unsupported registries, resetTime should be zero
-			if tt.pkg.Registry != "github.com" && tt.pkg.Registry != "gitlab.com" {
+			default:
 				if !resetTime.IsZero() {
 					t.Error("Expected zero resetTime for unsupported registry")
 				}

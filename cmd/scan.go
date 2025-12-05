@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -277,11 +278,16 @@ func analyseFilePath(projectPath string) (bool, string, error) {
 
 func generateSBOM(projectPath string) ([]SBOMModule, error) {
 	// Use go list to get module information
-	cmd := exec.Command("go", "list", "-json", "-m", "all")
+	ctx, cancel := context.WithTimeout(context.Background(), goListTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "list", "-json", "-m", "all")
 	cmd.Dir = projectPath
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("'go list -m all' command timed out after %v: %w. Verify the validity of 'go.mod' and 'go.sum'", goListTimeout, ctx.Err())
+		}
 		return nil, fmt.Errorf("go list failed: %w\nOutput: %s", err, string(output))
 	}
 
@@ -547,7 +553,7 @@ func checkGitHubUser(client *http.Client, owner string) (exists bool, statusCode
 
 func checkGitLabUser(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
 	// GitLab API doc: https://docs.gitlab.com/ee/api/users.html#for-user
-	url := fmt.Sprintf("https://gitlab.com/api/v4/users?username=%s", owner)
+	url := "https://gitlab.com/api/v4/users?username=" + owner
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return false, 0, time.Time{}
