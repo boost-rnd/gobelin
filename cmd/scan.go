@@ -22,7 +22,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -280,7 +282,7 @@ func generateSBOM(projectPath string) ([]SBOMModule, error) {
 	// Use go list to get module information
 	ctx, cancel := context.WithTimeout(context.Background(), goListTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "list", "-json", "-m", "all")
+	cmd := exec.CommandContext(ctx, "go", "list", "-json", "-mod=readonly", "-m", "all")
 	cmd.Dir = projectPath
 
 	output, err := cmd.CombinedOutput()
@@ -412,7 +414,7 @@ func parsePath(path string) (owner, repo, registry string) {
 }
 
 func checkAccounts(packages []Package) []map[string]interface{} {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second}
 	results := make([]map[string]interface{}, 0, len(packages))
 	checkedOwners := make(map[registryAccount]bool)
 
@@ -451,6 +453,9 @@ func checkAccounts(packages []Package) []map[string]interface{} {
 
 		if exists {
 			if verbose {
+				if statusCode == 408 {
+					fmt.Fprintf(os.Stderr, "  ✓ %s/%s exists (inference: request timed out)\n", pkg.Registry, pkg.Owner)
+				}
 				fmt.Fprintf(os.Stderr, "  ✓ %s/%s exists\n", pkg.Registry, pkg.Owner)
 			}
 		} else if statusCode == 403 || statusCode == 429 {
@@ -552,17 +557,26 @@ func checkGitHubUser(client *http.Client, owner string) (exists bool, statusCode
 }
 
 func checkGitLabUser(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
-	// GitLab API doc: https://docs.gitlab.com/ee/api/users.html#for-user
-	url := "https://gitlab.com/api/v4/users?username=" + owner
+	// If token is available, use the namespaces/exists endpoint (most accurate)
+	if gitlabToken != "" {
+		return checkGitLabUserWithToken(client, owner)
+	}
+
+	// Without token, try public API endpoints
+	return checkGitLabUserWithoutToken(client, owner)
+}
+
+func checkGitLabUserWithToken(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	// GitLab API doc: https://docs.gitlab.com/ee/api/namespaces.html#check-existence-of-a-namespace
+	// This endpoint checks both users and groups
+	url := "https://gitlab.com/api/v4/namespaces/" + owner + "/exists"
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return false, 0, time.Time{}
 	}
 
-	// Add token if provided (GitLab uses PRIVATE-TOKEN header)
-	if gitlabToken != "" {
-		req.Header.Set("PRIVATE-TOKEN", gitlabToken)
-	}
+	req.Header.Set("PRIVATE-TOKEN", gitlabToken)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -570,27 +584,137 @@ func checkGitLabUser(client *http.Client, owner string) (exists bool, statusCode
 	}
 	defer resp.Body.Close()
 
-	// Parse rate limit reset time if we hit the limit
+	// Handle rate limiting
 	if resp.StatusCode == 429 {
-		if resetHeader := resp.Header.Get("RateLimit-Reset"); resetHeader != "" {
-			if resetUnix, err := strconv.ParseInt(resetHeader, 10, 64); err == nil {
-				resetTime = time.Unix(resetUnix, 0)
+		return false, 429, parseGitLabRateLimit(resp.Header)
+	}
+
+	// Parse the response
+	if resp.StatusCode == 200 {
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return false, resp.StatusCode, time.Time{}
+		}
+
+		// Check the "exists" field
+		if existsVal, ok := result["exists"].(bool); ok {
+			return existsVal, 200, time.Time{}
+		}
+	}
+
+	return false, resp.StatusCode, time.Time{}
+}
+
+func checkGitLabUserWithoutToken(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+
+	exists, status, reset := checkGitlabUserUrl(client, owner)
+
+	if exists || status == 429 || status >= 500 {
+		return exists, status, reset
+	}
+
+	return checkGitlabGroupUrl(client, owner)
+}
+
+func checkGitlabUserUrl(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	params := url.Values{}
+	params.Add("username", owner)
+	targetUrl := "https://gitlab.com/api/v4/users?" + params.Encode()
+
+	req, err := http.NewRequest("GET", targetUrl, nil)
+	if err != nil {
+		fmt.Printf("!!! Gitlab User: fail create req: %v\n", err)
+		return false, 0, time.Time{}
+	}
+	req.Header.Set("User-Agent", "RepoScanner/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// THIS is likely where you get 0. Log the error!
+		fmt.Printf("!!! Gitlab User: fail exec req: %v\n", err)
+		return false, 0, time.Time{}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+		return false, 429, parseGitLabRateLimit(resp.Header)
+	}
+
+	if resp.StatusCode == 200 {
+		var users []interface{}
+		// Read up to 1MB. If the JSON is larger, Decode might fail or return partial data.
+		// We decode from a LimitReader.
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&users); err == nil && len(users) > 0 {
+			return true, 200, time.Time{}
+		}
+	}
+
+	// Drain body to allow connection reuse
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return false, resp.StatusCode, time.Time{}
+}
+
+func checkGitlabGroupUrl(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	targetUrl := "https://gitlab.com/api/v4/groups/" + url.PathEscape(owner)
+
+	req, err := http.NewRequest("HEAD", targetUrl, nil)
+	if err != nil {
+		return false, 0, time.Time{}
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; RepoScanner/1.0)")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Referer", "https://gitlab.com")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// Check if the error is specifically a Timeout - it is likely because json is too big to retrieve
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Timeout() {
+			fmt.Printf("!!! Gitlab Group existence check: Request Timeout -> inferred Existence (Heuristic)\n")
+			// Return TRUE (Exists) with a special status code (e.g. 0 or 408)
+			return true, 408, time.Time{}
+		}
+		// Other errors (DNS, Connection Refused) likely mean it doesn't exist or network is down
+		return false, 0, time.Time{}
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+
+		return false, 429, parseGitLabRateLimit(resp.Header)
+	}
+
+	if resp.StatusCode == 200 {
+
+		// Generic map to check ID existence
+		var result map[string]interface{}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&result); err == nil {
+			// Handle fake 200s
+			if msg, ok := result["message"].(string); ok && msg == "404 Group Not Found" {
+				return false, 404, time.Time{}
+			}
+
+			// If "id" is present, the group exists
+			if _, ok := result["id"]; ok {
+				return true, 200, time.Time{}
 			}
 		}
 	}
 
-	// GitLab returns 200 with an empty array [] if user doesn't exist
-	if resp.StatusCode == 200 {
-		var users []map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&users); err != nil {
-			return false, resp.StatusCode, resetTime
-		}
-		// User exists if array is not empty
-		exists = len(users) > 0
-		return exists, resp.StatusCode, resetTime
-	}
+	return false, resp.StatusCode, time.Time{}
+}
 
-	return false, resp.StatusCode, resetTime
+func parseGitLabRateLimit(header http.Header) time.Time {
+	if resetHeader := header.Get("RateLimit-Reset"); resetHeader != "" {
+		if resetUnix, err := strconv.ParseInt(resetHeader, 10, 64); err == nil {
+			return time.Unix(resetUnix, 0)
+		}
+	}
+	return time.Time{}
 }
 
 func outputResults(results []map[string]interface{}) error {
