@@ -40,6 +40,11 @@ func TestRootCmd(t *testing.T) {
 			t.Error("rootCmd should have --token flag")
 		}
 
+		gitlabTokenFlag := rootCmd.PersistentFlags().Lookup("gitlab-token")
+		if gitlabTokenFlag == nil {
+			t.Error("rootCmd should have --gitlab-token flag")
+		}
+
 		outputFlag := rootCmd.PersistentFlags().Lookup("output")
 		if outputFlag == nil {
 			t.Error("rootCmd should have --output flag")

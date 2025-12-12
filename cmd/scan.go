@@ -18,10 +18,13 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,10 +36,11 @@ import (
 )
 
 type Package struct {
-	Path    string
-	Version string
-	Owner   string
-	Repo    string
+	Path     string
+	Version  string
+	Owner    string
+	Repo     string
+	Registry string
 }
 
 type SBOMModule struct {
@@ -45,9 +49,16 @@ type SBOMModule struct {
 	Replace *SBOMModule `json:"Replace,omitempty"` // Handles replace directives
 }
 
+type registryAccount struct {
+	Registry string
+	Owner    string
+}
+
 var (
-	githubToken string
-	outputFile  string
+	githubToken   string
+	gitlabToken   string
+	outputFile    string
+	goListTimeout time.Duration = 30 * time.Second
 )
 
 // scanCmd represents the scan command
@@ -109,10 +120,50 @@ func detectGitHubToken() string {
 	return ""
 }
 
+// detectGitLabToken attempts to auto-detect a GitLab token from environment or gh CLI
+func detectGitLabToken() string {
+	// Try GL_TOKEN environment variable first
+	if token := os.Getenv("GL_TOKEN"); token != "" {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "→ Using GitLab token from GL_TOKEN\n")
+		}
+		return token
+	}
+
+	// Try GITLAB_TOKEN environment variable (common in CI)
+	if token := os.Getenv("GITLAB_TOKEN"); token != "" {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "→ Using GitLab token from GITLAB_TOKEN\n")
+		}
+		return token
+	}
+
+	// Try glab CLI auth token
+	cmd := exec.Command("glab", "auth", "status", "--show-token")
+	output, err := cmd.Output()
+	if err == nil && len(output) > 0 {
+		token := strings.TrimSpace(string(output))
+		if token != "" {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "→ Using GitLab token from 'glab auth status --show-token'\n")
+			}
+			return token
+		}
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stderr, "→ No GitLab token found, proceeding without authentication\n")
+	}
+	return ""
+}
+
 func ScanProject(cmd *cobra.Command, args []string) error {
-	// Auto-detect GitHub token if not provided
+	// Auto-detect tokens if not provided
 	if githubToken == "" {
 		githubToken = detectGitHubToken()
+	}
+	if gitlabToken == "" {
+		gitlabToken = detectGitLabToken()
 	}
 
 	projectPath := "."
@@ -172,13 +223,13 @@ func ScanProject(cmd *cobra.Command, args []string) error {
 
 	uniqueAccounts := countUniqueOwners(packages)
 	if verbose {
-		fmt.Fprintf(os.Stderr, "→ Checking %d unique GitHub accounts...\n", uniqueAccounts)
+		fmt.Fprintf(os.Stderr, "→ Checking %d unique accounts...\n", uniqueAccounts)
 	} else if outputFormat == "text" {
-		fmt.Printf("Checking %d unique GitHub accounts...\n", uniqueAccounts)
+		fmt.Printf("Checking %d unique accounts...\n", uniqueAccounts)
 	}
 
-	// Check GitHub accounts
-	results := checkGitHubAccounts(packages)
+	// Check GitHub and GitLab accounts
+	results := checkAccounts(packages)
 
 	// Output results
 	return outputResults(results)
@@ -229,11 +280,16 @@ func analyseFilePath(projectPath string) (bool, string, error) {
 
 func generateSBOM(projectPath string) ([]SBOMModule, error) {
 	// Use go list to get module information
-	cmd := exec.Command("go", "list", "-json", "-m", "all")
+	ctx, cancel := context.WithTimeout(context.Background(), goListTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "list", "-json", "-mod=readonly", "-m", "all")
 	cmd.Dir = projectPath
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("'go list -m all' command timed out after %v: %w. Verify the validity of 'go.mod' and 'go.sum'", goListTimeout, ctx.Err())
+		}
 		return nil, fmt.Errorf("go list failed: %w\nOutput: %s", err, string(output))
 	}
 
@@ -265,16 +321,17 @@ func extractPackages(sbom []SBOMModule) []Package {
 		}
 
 		// Extract GitHub owner and repo
-		owner, repo := parseGitHubPath(actualModule.Path)
+		owner, repo, registry := parsePath(actualModule.Path)
 		if owner == "" {
 			continue
 		}
 
 		packages = append(packages, Package{
-			Path:    actualModule.Path,
-			Version: actualModule.Version,
-			Owner:   owner,
-			Repo:    repo,
+			Registry: registry,
+			Path:     actualModule.Path,
+			Version:  actualModule.Version,
+			Owner:    owner,
+			Repo:     repo,
 		})
 	}
 
@@ -300,19 +357,17 @@ func readPackagesFromFile(filePath string) ([]Package, error) {
 		packagePath := line
 
 		// Extract owner and repo
-		owner, repo := parseGitHubPath(packagePath)
+		owner, repo, registry := parsePath(packagePath)
 		if owner == "" {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "⚠ Could not parse GitHub path (line %d: %s)\n", lineNumber, line)
-			}
 			continue
 		}
 
 		packages = append(packages, Package{
-			Path:    packagePath,
-			Version: "", // Version unknown for file-based packages
-			Owner:   owner,
-			Repo:    repo,
+			Registry: registry,
+			Path:     packagePath,
+			Version:  "", // Version unknown for file-based packages
+			Owner:    owner,
+			Repo:     repo,
 		})
 	}
 
@@ -327,43 +382,69 @@ func readPackagesFromFile(filePath string) ([]Package, error) {
 	return packages, nil
 }
 
-func parseGitHubPath(path string) (owner, repo string) {
-	// Handle github.com paths
-	if strings.HasPrefix(path, "github.com/") {
+func parsePath(path string) (owner, repo, registry string) {
+	// Handle github.com and gitlab.com paths
+	if strings.HasPrefix(path, "github.com/") || strings.HasPrefix(path, "gitlab.com/") {
 		parts := strings.Split(path, "/")
 		if len(parts) >= 3 {
+			registry = parts[0]
 			owner = parts[1]
 			repo = parts[2]
 			return
 			// Ok if just the owner
 		} else if len(parts) >= 2 {
+			registry = parts[0]
 			owner = parts[1]
 			repo = ""
 			return
+		} else {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "⚠ Skipping check of package at path %s. Missing information.\n", path)
+			}
 		}
+	} else if strings.HasPrefix(path, "golang.org/") {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "(Skipping check of go built in module %s.)\n", path)
+		}
+	} else {
+		registry = strings.Split(path, "/")[0]
+		fmt.Fprintf(os.Stderr, "⚠ Unsupported registry %s. Could not verify package path %s.\n", registry, path)
 	}
-
-	return "", ""
+	return "", "", ""
 }
 
-func checkGitHubAccounts(packages []Package) []map[string]interface{} {
-	client := &http.Client{Timeout: 10 * time.Second}
+func checkAccounts(packages []Package) []map[string]interface{} {
+	client := &http.Client{Timeout: 30 * time.Second}
 	results := make([]map[string]interface{}, 0, len(packages))
-	checkedOwners := make(map[string]bool)
+	checkedOwners := make(map[registryAccount]bool)
 
 	if githubToken != "" && verbose {
 		fmt.Fprintf(os.Stderr, "→ Using provided GitHub token\n")
 	}
 
+	if gitlabToken != "" && verbose {
+		fmt.Fprintf(os.Stderr, "→ Using provided GitLab token\n")
+	}
+
 	for _, pkg := range packages {
+
+		accountKey := registryAccount{
+			Registry: pkg.Registry,
+			Owner:    pkg.Owner,
+		}
+
 		// Skip if we already checked this owner
-		if checkedOwners[pkg.Owner] {
+		if checkedOwners[accountKey] {
+			if verbose {
+				fmt.Fprintf(os.Stderr, "→ Skipping already checked %s account %s\n", accountKey.Registry, accountKey.Owner)
+			}
 			continue
 		}
 
-		exists, statusCode, resetTime := checkGitHubUser(client, pkg.Owner)
+		exists, statusCode, resetTime := checkUser(client, pkg)
 
 		result := map[string]interface{}{
+			"registry":    pkg.Registry,
 			"owner":       pkg.Owner,
 			"exists":      exists,
 			"status_code": statusCode,
@@ -372,7 +453,10 @@ func checkGitHubAccounts(packages []Package) []map[string]interface{} {
 
 		if exists {
 			if verbose {
-				fmt.Fprintf(os.Stderr, "  ✓ %s\n", pkg.Owner)
+				if statusCode == 408 {
+					fmt.Fprintf(os.Stderr, "  ✓ %s/%s exists (inference: request timed out)\n", pkg.Registry, pkg.Owner)
+				}
+				fmt.Fprintf(os.Stderr, "  ✓ %s/%s exists\n", pkg.Registry, pkg.Owner)
 			}
 		} else if statusCode == 403 || statusCode == 429 {
 			if verbose {
@@ -399,30 +483,45 @@ func checkGitHubAccounts(packages []Package) []map[string]interface{} {
 			if verbose {
 				fmt.Fprintf(os.Stderr, "  ↻ Retrying %s...\n", pkg.Owner)
 			}
-			exists, statusCode, _ = checkGitHubUser(client, pkg.Owner)
+			exists, statusCode, _ = checkUser(client, pkg)
 			result["exists"] = exists
 			result["status_code"] = statusCode
 
 			if exists {
 				if verbose {
-					fmt.Fprintf(os.Stderr, "  ✓ %s (after retry)\n", pkg.Owner)
+					fmt.Fprintf(os.Stderr, "  ✓ %s/%s exists (after retry)\n", pkg.Registry, pkg.Owner)
 				}
 			} else {
 				if verbose {
-					fmt.Fprintf(os.Stderr, "  ✗ %s NOT FOUND (status: %d)\n", pkg.Owner, statusCode)
+					fmt.Fprintf(os.Stderr, "  ✗ %s/%s NOT FOUND (status: %d)\n", pkg.Registry, pkg.Owner, statusCode)
 				}
 			}
 		} else {
 			if verbose {
-				fmt.Fprintf(os.Stderr, "  ✗ %s NOT FOUND (status: %d)\n", pkg.Owner, statusCode)
+				fmt.Fprintf(os.Stderr, "  ✗ %s/%s NOT FOUND (status: %d)\n", pkg.Registry, pkg.Owner, statusCode)
 			}
 		}
 
 		results = append(results, result)
-		checkedOwners[pkg.Owner] = true
+		checkedOwners[accountKey] = true
 	}
 
 	return results
+}
+
+func checkUser(client *http.Client, pkg Package) (exists bool, status int, resetTime time.Time) {
+	switch pkg.Registry {
+	case "github.com":
+		return checkGitHubUser(client, pkg.Owner)
+
+	case "gitlab.com":
+		return checkGitLabUser(client, pkg.Owner)
+
+	default:
+		// Registry not supported
+		fmt.Fprintf(os.Stderr, "✗ Unsupported registry %s. Impossible to check account %s/%s", pkg.Registry, pkg.Registry, pkg.Owner)
+		return false, 0, time.Time{}
+	}
 }
 
 func checkGitHubUser(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
@@ -455,7 +554,167 @@ func checkGitHubUser(client *http.Client, owner string) (exists bool, statusCode
 	}
 
 	return resp.StatusCode == 200, resp.StatusCode, resetTime
+}
 
+func checkGitLabUser(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	// If token is available, use the namespaces/exists endpoint (most accurate)
+	if gitlabToken != "" {
+		return checkGitLabUserWithToken(client, owner)
+	}
+
+	// Without token, try public API endpoints
+	return checkGitLabUserWithoutToken(client, owner)
+}
+
+func checkGitLabUserWithToken(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	// GitLab API doc: https://docs.gitlab.com/ee/api/namespaces.html#check-existence-of-a-namespace
+	// This endpoint checks both users and groups
+	url := "https://gitlab.com/api/v4/namespaces/" + owner + "/exists"
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, 0, time.Time{}
+	}
+
+	req.Header.Set("PRIVATE-TOKEN", gitlabToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, 0, time.Time{}
+	}
+	defer resp.Body.Close()
+
+	// Handle rate limiting
+	if resp.StatusCode == 429 {
+		return false, 429, parseGitLabRateLimit(resp.Header)
+	}
+
+	// Parse the response
+	if resp.StatusCode == 200 {
+		var result map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return false, resp.StatusCode, time.Time{}
+		}
+
+		// Check the "exists" field
+		if existsVal, ok := result["exists"].(bool); ok {
+			return existsVal, 200, time.Time{}
+		}
+	}
+
+	return false, resp.StatusCode, time.Time{}
+}
+
+func checkGitLabUserWithoutToken(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+
+	exists, status, reset := checkGitlabUserUrl(client, owner)
+
+	if exists || status == 429 || status >= 500 {
+		return exists, status, reset
+	}
+
+	return checkGitlabGroupUrl(client, owner)
+}
+
+func checkGitlabUserUrl(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	params := url.Values{}
+	params.Add("username", owner)
+	targetUrl := "https://gitlab.com/api/v4/users?" + params.Encode()
+
+	req, err := http.NewRequest("GET", targetUrl, nil)
+	if err != nil {
+		fmt.Printf("!!! Gitlab User: fail create req: %v\n", err)
+		return false, 0, time.Time{}
+	}
+	req.Header.Set("User-Agent", "RepoScanner/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// THIS is likely where you get 0. Log the error!
+		fmt.Printf("!!! Gitlab User: fail exec req: %v\n", err)
+		return false, 0, time.Time{}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+		return false, 429, parseGitLabRateLimit(resp.Header)
+	}
+
+	if resp.StatusCode == 200 {
+		var users []interface{}
+		// Read up to 1MB. If the JSON is larger, Decode might fail or return partial data.
+		// We decode from a LimitReader.
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&users); err == nil && len(users) > 0 {
+			return true, 200, time.Time{}
+		}
+	}
+
+	// Drain body to allow connection reuse
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return false, resp.StatusCode, time.Time{}
+}
+
+func checkGitlabGroupUrl(client *http.Client, owner string) (exists bool, statusCode int, resetTime time.Time) {
+	targetUrl := "https://gitlab.com/api/v4/groups/" + url.PathEscape(owner)
+
+	req, err := http.NewRequest("HEAD", targetUrl, nil)
+	if err != nil {
+		return false, 0, time.Time{}
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; RepoScanner/1.0)")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Referer", "https://gitlab.com")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// Check if the error is specifically a Timeout - it is likely because json is too big to retrieve
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Timeout() {
+			fmt.Printf("!!! Gitlab Group existence check: Request Timeout -> inferred Existence (Heuristic)\n")
+			// Return TRUE (Exists) with a special status code (e.g. 0 or 408)
+			return true, 408, time.Time{}
+		}
+		// Other errors (DNS, Connection Refused) likely mean it doesn't exist or network is down
+		return false, 0, time.Time{}
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+
+		return false, 429, parseGitLabRateLimit(resp.Header)
+	}
+
+	if resp.StatusCode == 200 {
+
+		// Generic map to check ID existence
+		var result map[string]interface{}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&result); err == nil {
+			// Handle fake 200s
+			if msg, ok := result["message"].(string); ok && msg == "404 Group Not Found" {
+				return false, 404, time.Time{}
+			}
+
+			// If "id" is present, the group exists
+			if _, ok := result["id"]; ok {
+				return true, 200, time.Time{}
+			}
+		}
+	}
+
+	return false, resp.StatusCode, time.Time{}
+}
+
+func parseGitLabRateLimit(header http.Header) time.Time {
+	if resetHeader := header.Get("RateLimit-Reset"); resetHeader != "" {
+		if resetUnix, err := strconv.ParseInt(resetHeader, 10, 64); err == nil {
+			return time.Unix(resetUnix, 0)
+		}
+	}
+	return time.Time{}
 }
 
 func outputResults(results []map[string]interface{}) error {
